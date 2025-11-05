@@ -1,0 +1,24 @@
+[project]
+name = "treadmill-monitor"
+version = "0.1.0"
+description = "Cross-platform desktop application for monitoring FTMS-enabled treadmills."
+license = { text = "MIT" }
+readme = "README.md"
+authors = [
+    { name = "PJBarczyk", email = "pjbarczyk.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "cyclopts>=4.2.1",
+    "janus>=2.0.0",
+    "loguru>=0.7.3",
+    "pyftms>=0.4.15",
+    "pywebview>=6.1",
+]
+
+[project.scripts]
+treadmill-monitor = "treadmill_monitor:app"
+
+[build-system]
+requires = ["uv_build>=0.9.6,<0.10.0"]
+build-backend = "uv_build"
