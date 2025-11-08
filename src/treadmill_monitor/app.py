@@ -1,95 +1,127 @@
 import asyncio
-from pathlib import Path
-from typing import Annotated
 import sys
+import threading
+from typing import Annotated
+from typing_extensions import Literal
 
-from treadmill_monitor.client import TreadmillClient
-from treadmill_monitor.processors import (
-    CompoundTreadmillUpdateProcessor,
-    CsvSinkTreadmillUpdateProcessor,
-    ResumeableTreadmillUpdateProcessor,
-    TreadmillUpdateProcessor,
-)
-from treadmill_monitor.templates import HTML
-import webview
-from cyclopts import App, Parameter, validators
+import janus
+from treadmill_monitor.gui import Gui
+from cyclopts import App, Parameter
 from loguru import logger
 
-
-async def app_logic(
-    window: webview.Window,
-    closed_event: asyncio.Event,
-    update_processor: TreadmillUpdateProcessor,
-    address: str | None = None,
-):
-    client = TreadmillClient(address)
-
-    await client.start()
-
-    while not closed_event.is_set():
-        try:
-            async with asyncio.timeout(1):
-                update = await client.update_queue.async_q.get()
-                processed_value = update_processor.process(update.key, update.value)
-
-                setattr(window.state, update.key, processed_value)
-                logger.debug(f"Updated window state: {update.key} = {processed_value}")
-        except asyncio.TimeoutError:
-            pass
-        except Exception as e:
-            window.destroy()
-            raise e
-
-    await client.stop()
+from treadmill_monitor.interceptors import (
+    GuiUpdateInterceptor,
+    LoggingInterceptor,
+    ResumableInterceptor,
+    StdoutInterceptor,
+    UpdateInterceptor,
+    run_interceptor_chain,
+)
+from treadmill_monitor.models import TreadmillUpdate
+from treadmill_monitor.producers import MtfsProducer, StdinProducer, UpdateProducer
+from treadmill_monitor.serializers import (
+    CsvSerializer,
+    JsonlSerializer,
+    UpdateSerializer,
+)
 
 
 app = App()
 
 
+Format = Literal["csv", "jsonl"]
+
+
+def get_serializer(format: Format) -> UpdateSerializer:
+    match format:
+        case "csv":
+            return CsvSerializer(allow_missing_timestamp=True)
+        case "jsonl":
+            return JsonlSerializer()
+        case _:
+            raise ValueError(f"Unsupported format: {format}")
+
+
 @app.default
 async def main(
     address: str | None = None,
-    resumable: bool = False,
-    log_file: Annotated[
-        Path | None, Parameter(validator=validators.Path(dir_okay=False))
-    ] = None,
-    debug: bool = False,
+    input: Annotated[Format, Parameter(name=["-i", "--input"])] = None,
+    output: Annotated[Format, Parameter(name=["-o", "--output"])] = None,
+    resumable: Annotated[
+        bool, Parameter(name=["-r", "--resumable"], negative="")
+    ] = False,
+    headless: Annotated[bool, Parameter(negative="")] = False,
+    verbose: Annotated[bool, Parameter(negative="")] = False,
+    debug: Annotated[bool, Parameter(negative="")] = False,
 ):
     """
     Monitor FTMS-enabled treadmill and display data in a GUI window.
 
     Args:
         address: Optional Bluetooth address of the FTMS device to connect to, specifying this will skip device scanning.
+        input: Optional format of treadmill data to read from standard input.
+        output: Optional format of treadmill data to write to standard output.
         resumable: Enable resumable mode that accumulates certain metrics across sessions until the application is closed.
-        log_file: Path to a CSV file where treadmill data will be logged.
+        headless: Run in headless mode without GUI.
+        verbose: Enable verbose logging.
         debug: Enable WebView debug mode and verbose logging.
     """
+    log_level = "DEBUG" if debug or verbose else "INFO"
     logger.remove()
-    logger.add(sys.stderr, level="DEBUG" if debug else "INFO")
+    logger.add(sys.stderr, level=log_level)
 
-    processors: list[TreadmillUpdateProcessor] = []
+    interceptors: list[UpdateInterceptor] = [LoggingInterceptor("DEBUG")]
+    close_event = threading.Event()
 
-    if log_file is not None:
-        logger.info(f"Logging treadmill data to CSV file: {log_file}")
-        processors.append(CsvSinkTreadmillUpdateProcessor(log_file))
     if resumable:
         logger.info("Enabling resumable mode for certain metrics.")
-        processors.append(ResumeableTreadmillUpdateProcessor())
+        keys_to_accumulate = ["time_elapsed", "distance_total", "energy_total"]
+        interceptors.append(ResumableInterceptor(keys_to_accumulate))
 
-    processor = CompoundTreadmillUpdateProcessor(processors)
+    if output:
+        logger.info("Enabling stdout output for treadmill data.")
+        interceptors.append(StdoutInterceptor(get_serializer(output)))
 
-    closed_event = asyncio.Event()
-    window = webview.create_window(
-        title="Treadmill Monitor",
-        html=HTML,
-        width=150,
-        height=510,
-        frameless=True,
-        confirm_close=resumable,
+    gui: Gui | None = None
+    if not headless:
+        gui = Gui(
+            debug=debug,
+            confirm_close=resumable,
+        )
+        gui.on_close(lambda: close_event.set())
+        gui.start()
+
+        interceptors.append(GuiUpdateInterceptor(gui))
+
+    producers: list[UpdateProducer] = [MtfsProducer(address)]
+
+    if input:
+        logger.info("Enabling stdin input for treadmill data.")
+        producers.append(StdinProducer(get_serializer(input)))
+
+    queue = janus.Queue[TreadmillUpdate]()
+    producer_start_task = asyncio.gather(
+        *[producer.start(queue) for producer in producers]
     )
-    window.events.closed += lambda: closed_event.set()
 
-    webview.start(
-        lambda: asyncio.run(app_logic(window, closed_event, processor, address)),
-        debug=debug,
-    )
+    async def process_updates():
+        while not close_event.is_set():
+            try:
+                async with asyncio.timeout(1):
+                    update = await queue.async_q.get()
+                    run_interceptor_chain(interceptors, update)
+
+            except asyncio.TimeoutError:
+                continue
+
+    try:
+        await process_updates()
+    finally:
+        logger.info("Shutting down...")
+        close_event.set()
+
+        await producer_start_task
+        await asyncio.gather(*[producer.stop() for producer in producers])
+
+        if gui is not None:
+            gui.stop()

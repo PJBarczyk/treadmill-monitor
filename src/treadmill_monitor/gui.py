@@ -1,3 +1,95 @@
+from collections.abc import Callable
+import multiprocessing
+import queue
+import threading
+
+import webview
+
+from treadmill_monitor.models import TreadmillUpdate
+
+
+class Gui:
+    def __init__(self, debug: bool = False, confirm_close: bool = False):
+        self.debug = debug
+        self.confirm_close = confirm_close
+
+        self._update_queue: queue.Queue[TreadmillUpdate] = multiprocessing.Queue()
+        self._closed_event: threading.Event = multiprocessing.Event()
+        self._process: multiprocessing.Process | None = None
+        self._on_close_callbacks: list[Callable[[], None]] = []
+
+    def push_update(self, update: TreadmillUpdate):
+        self._update_queue.put(update)
+
+    def start(self):
+        assert self._process is None, "GuiMonitor is already started."
+
+        def handle_close_callbacks():
+            self._closed_event.wait()
+            [cb() for cb in self._on_close_callbacks]
+
+        threading.Thread(target=handle_close_callbacks, daemon=True).start()
+
+        self._process = multiprocessing.Process(
+            target=self._run_webview,
+            args=(
+                self._update_queue,
+                self._closed_event,
+                self.debug,
+                self.confirm_close,
+            ),
+        )
+        self._process.start()
+
+    def stop(self):
+        assert self._process is not None, "GuiMonitor is not started."
+        self._closed_event.set()
+        self._process.terminate()
+        self._process.join()
+        self._process = None
+
+    @staticmethod
+    def _run_webview(
+        update_queue: queue.Queue[TreadmillUpdate],
+        closed_event: threading.Event,
+        debug: bool,
+        confirm_close: bool,
+    ):
+        loaded_event = threading.Event()
+        window = webview.create_window(
+            title="Treadmill Monitor",
+            html=HTML,
+            width=150,
+            height=510,
+            frameless=True,
+            confirm_close=confirm_close,
+        )
+
+        window.events.loaded += lambda: loaded_event.set()
+        window.events.closed += lambda: closed_event.set()
+
+        def wait_for_close():
+            closed_event.wait()
+            window.destroy()
+
+        threading.Thread(target=wait_for_close, daemon=True).start()
+
+        def func():
+            loaded_event.wait()
+            while not closed_event.is_set():
+                try:
+                    update = update_queue.get(timeout=0.1)
+                    setattr(window.state, update.key, update.value)
+                except queue.Empty:
+                    pass
+
+        webview.start(func, debug=debug)
+
+    def on_close(self, callable: Callable[[], None]):
+        self._on_close_callbacks.append(callable)
+        return callable
+
+
 HTML = """
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
